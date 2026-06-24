@@ -1,0 +1,27 @@
+*, *::before, *::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    font-family: 'IBM Plex Mono', monospace;
+    background-color: #000;
+    color: #fff;
+}
+
+input::-webkit-outer-spin-button,
+input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+@keyframes flicker {
+  0%, 40% { opacity: 0; }
+  20%, 60%, 100% { opacity: 1; }
+}
+
+.flicker {
+  opacity: 0;
+  animation: flicker 200ms forwards;
+}

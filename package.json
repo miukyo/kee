@@ -1,0 +1,32 @@
+{
+  "name": "kee",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "check": "svelte-check --tsconfig ./tsconfig.app.json && tsc -p tsconfig.node.json"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^7.1.2",
+    "@tsconfig/svelte": "^5.0.8",
+    "@types/node": "^24.12.3",
+    "@unocss/preset-wind4": "^66.7.2",
+    "@unocss/transformer-directives": "^66.7.2",
+    "@unocss/transformer-variant-group": "^66.7.2",
+    "svelte": "^5.55.5",
+    "svelte-check": "^4.4.8",
+    "typescript": "~6.0.2",
+    "unocss": "^66.7.2",
+    "vite": "^8.0.12"
+  },
+  "dependencies": {
+    "@fontsource/ibm-plex-mono": "^5.2.7",
+    "hash-wasm": "^4.12.0",
+    "html5-qrcode": "^2.3.8",
+    "idb-keyval": "^6.2.5",
+    "otplib": "^13.4.1"
+  }
+}
