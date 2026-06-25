@@ -1,5 +1,4 @@
 import type { PasswordEntry } from "./types";
-import { savePassword, removePassword } from "./db";
 
 export const UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 export const LOWER = "abcdefghijklmnopqrstuvwxyz";
@@ -41,7 +40,6 @@ export async function addPwFn(
         value,
         createdAt: Date.now(),
     };
-    await savePassword(entry);
     return [...entries, entry];
 }
 
@@ -49,6 +47,5 @@ export async function deletePwFn(
     id: string,
     entries: PasswordEntry[],
 ): Promise<PasswordEntry[]> {
-    await removePassword(id);
     return entries.filter((e) => e.id !== id);
 }

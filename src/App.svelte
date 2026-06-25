@@ -1,7 +1,20 @@
 <script lang="ts">
     import { onMount } from "svelte";
-    import { generateTOTP } from "./lib/crypto";
-    import { loadTfa, loadPasswords, saveTfa, savePassword } from "./lib/db";
+    import {
+        deriveKey,
+        encryptData,
+        decryptData,
+        setMasterKey,
+        getMasterKey,
+        generateTOTP,
+    } from "./lib/crypto";
+    import {
+        hasVault,
+        getVaultMeta,
+        setVaultMeta,
+        loadVault,
+        saveVault,
+    } from "./lib/db";
     import TextScramble from "./components/TextScramble.svelte";
     import AsciiWaves from "./components/AsciiWaves.svelte";
     import type { TwoFactorEntry, PasswordEntry } from "./lib/types";
@@ -27,6 +40,13 @@
         decryptBackup,
     } from "./lib/backup";
     import { GOOGLE_CLIENT_ID } from "./lib/config";
+
+    type AppState = "loading" | "setup" | "unlock" | "ready";
+
+    let appState = $state<AppState>("loading");
+    let pin = $state("");
+    let pinError = $state("");
+    let pinLoading = $state(false);
 
     let tfaEntries = $state<TwoFactorEntry[]>([]);
     let pwEntries = $state<PasswordEntry[]>([]);
@@ -59,18 +79,12 @@
 
     onMount(() => {
         const init = async () => {
-            tfaEntries = await loadTfa();
-            pwEntries = await loadPasswords();
-            for (const e of tfaEntries) {
-                if (e.secret) tokens[e.id] = await generateTOTP(e.secret);
-            }
-
             await initGoogle();
-            const sub = await tryRestoreSession();
-            if (sub) {
-                googleSub = sub;
-                await autoRestore();
-                autoBackup();
+            const vaultExists = await hasVault();
+            if (vaultExists) {
+                appState = "unlock";
+            } else {
+                appState = "setup";
             }
         };
         init();
@@ -80,6 +94,81 @@
 
         return () => clearInterval(id);
     });
+
+    async function handlePinSetup() {
+        const p = pin.trim();
+        if (p.length < 4 || !/^\d+$/.test(p)) {
+            pinError = "PIN MUST BE 4+ DIGITS";
+            return;
+        }
+        pinLoading = true;
+        pinError = "";
+        try {
+            const saltBytes = window.crypto.getRandomValues(new Uint8Array(16));
+            const salt = btoa(String.fromCharCode(...saltBytes));
+            const key = await deriveKey(p, salt);
+            const { ciphertext, iv } = await encryptData("kee-ok", key);
+            await setVaultMeta({
+                salt,
+                testCiphertext: ciphertext,
+                testIv: iv,
+            });
+            setMasterKey(key);
+            await saveVault({ tfa: tfaEntries, passwords: pwEntries });
+            appState = "ready";
+        } catch (e: any) {
+            pinError = "SETUP FAILED";
+        }
+        pinLoading = false;
+    }
+
+    async function handlePinUnlock() {
+        const p = pin.trim();
+        if (!p) {
+            pinError = "ENTER PIN";
+            return;
+        }
+        pinLoading = true;
+        pinError = "";
+        try {
+            const meta = await getVaultMeta();
+            if (!meta) {
+                pinError = "NO VAULT FOUND";
+                pinLoading = false;
+                return;
+            }
+            const key = await deriveKey(p, meta.salt);
+            const test = await decryptData(
+                meta.testCiphertext,
+                meta.testIv,
+                key,
+            );
+            if (test !== "kee-ok") {
+                pinError = "WRONG PIN";
+                pinLoading = false;
+                return;
+            }
+            setMasterKey(key);
+            const data = await loadVault();
+            tfaEntries = data?.tfa ?? [];
+            pwEntries = data?.passwords ?? [];
+            for (const e of tfaEntries) {
+                if (e.secret) tokens[e.id] = await generateTOTP(e.secret);
+            }
+
+            appState = "ready";
+
+            tryRestoreSession().then((sub) => {
+                if (sub) {
+                    googleSub = sub;
+                    autoRestore().then(() => autoBackup());
+                }
+            });
+        } catch (e: any) {
+            pinError = "WRONG PIN";
+        }
+        pinLoading = false;
+    }
 
     async function tick() {
         const r = await tickFn(tfaEntries, lastWindow, tokens);
@@ -111,6 +200,7 @@
         const r = await addTfaFn(label, secret, tfaEntries, tokens);
         tfaEntries = r.entries;
         tokens = r.tokens;
+        await saveVault({ tfa: tfaEntries, passwords: pwEntries });
         newTfaLabel = "";
         newTfaSecret = "";
         showAddTfa = false;
@@ -121,6 +211,7 @@
         const r = await deleteTfaFn(id, tfaEntries, tokens);
         tfaEntries = r.entries;
         tokens = r.tokens;
+        await saveVault({ tfa: tfaEntries, passwords: pwEntries });
         autoBackup();
     }
 
@@ -140,6 +231,7 @@
         const label = newPwLabel.trim();
         if (!label || !newPwValue) return;
         pwEntries = await addPwFn(label, newPwValue, pwEntries);
+        await saveVault({ tfa: tfaEntries, passwords: pwEntries });
         newPwLabel = "";
         newPwValue = "";
         showAddPw = false;
@@ -148,6 +240,7 @@
 
     async function deletePw(id: string) {
         pwEntries = await deletePwFn(id, pwEntries);
+        await saveVault({ tfa: tfaEntries, passwords: pwEntries });
         autoBackup();
     }
 
@@ -255,28 +348,68 @@
 
             const existingTfaIds = new Set(tfaEntries.map((e) => e.id));
             const existingPwIds = new Set(pwEntries.map((e) => e.id));
-            let added = 0;
+            let changed = false;
 
             if (payload.tfa) {
                 for (const e of payload.tfa) {
                     if (existingTfaIds.has(e.id)) continue;
-                    await saveTfa(e);
                     tfaEntries = [...tfaEntries, e];
                     if (e.secret) tokens[e.id] = await generateTOTP(e.secret);
-                    added++;
+                    changed = true;
                 }
             }
             if (payload.passwords) {
                 for (const e of payload.passwords) {
                     if (existingPwIds.has(e.id)) continue;
-                    await savePassword(e);
                     pwEntries = [...pwEntries, e];
-                    added++;
+                    changed = true;
                 }
             }
-            showMsg(`RESTORED`);
+            if (changed) {
+                await saveVault({ tfa: tfaEntries, passwords: pwEntries });
+            }
+            showMsg("RESTORED");
         } catch (e: any) {
-            showMsg(`RESTORE FAILED`);
+            showMsg("RESTORE FAILED");
+        }
+    }
+
+    async function restoreFromBackup() {
+        if (!googleSub) return;
+        try {
+            const encrypted = await downloadBackup();
+            if (!encrypted) {
+                showMsg("NO BACKUP");
+                return;
+            }
+            const decrypted = await decryptBackup(encrypted, googleSub);
+            const payload = parseBackupPayload(decrypted);
+
+            const existingTfaIds = new Set(tfaEntries.map((e) => e.id));
+            const existingPwIds = new Set(pwEntries.map((e) => e.id));
+            let changed = false;
+
+            if (payload.tfa) {
+                for (const e of payload.tfa) {
+                    if (existingTfaIds.has(e.id)) continue;
+                    tfaEntries = [...tfaEntries, e];
+                    if (e.secret) tokens[e.id] = await generateTOTP(e.secret);
+                    changed = true;
+                }
+            }
+            if (payload.passwords) {
+                for (const e of payload.passwords) {
+                    if (existingPwIds.has(e.id)) continue;
+                    pwEntries = [...pwEntries, e];
+                    changed = true;
+                }
+            }
+            if (changed && getMasterKey()) {
+                await saveVault({ tfa: tfaEntries, passwords: pwEntries });
+            }
+            showMsg("RESTORED");
+        } catch {
+            showMsg("RESTORE FAILED");
         }
     }
 
@@ -291,21 +424,24 @@
         googleLoading = true;
         try {
             signIn()
-                .then(async ({ sub }) => {
+                .then(({ sub }) => {
                     googleSub = sub;
                     showMsg("SIGNED IN");
-                    await autoRestore();
-                    autoBackup();
+                    if (appState === "setup") {
+                        restoreFromBackup();
+                        return;
+                    }
+                    autoRestore().then(() => autoBackup());
                 })
                 .catch((e: any) => {
-                    showMsg(`SIGN IN FAILED`);
+                    showMsg("SIGN IN FAILED");
                     console.error("Google Sign-In Error:", e);
                 })
                 .finally(() => {
                     googleLoading = false;
                 });
         } catch (e: any) {
-            showMsg(`SIGN IN FAILED`);
+            showMsg("SIGN IN FAILED");
             console.error("Google Sign-In Error:", e);
             googleLoading = false;
         }
@@ -316,6 +452,20 @@
         googleSub = null;
         showMsg("SIGNED OUT");
     }
+
+    $effect(() => {
+        if (pin.length === 6) {
+            if (appState === "setup") handlePinSetup();
+            else if (appState === "unlock") handlePinUnlock();
+        }
+    });
+
+    function handlePinKeyDown(e: KeyboardEvent) {
+        if (e.key === "Enter") {
+            if (appState === "setup") handlePinSetup();
+            else if (appState === "unlock") handlePinUnlock();
+        }
+    }
 </script>
 
 <AsciiWaves />
@@ -324,408 +474,464 @@
     class="min-h-dvh bg-black text-white font-mono px-4 uppercase flex flex-col items-center"
 >
     <div class="w-full max-w-xl">
-        <div class="sticky top-0 z-10 bg-black pt-4">
-            <div
-                class="text-center text-xs mb-4 flicker"
-                style="animation-delay: 0ms"
-            >
-                <div class="mb-0.5">KEE</div>
-                <div class="text-white/50">2FA &amp; PASSWORD MANAGER</div>
+        {#if appState === "loading"}
+            <div class="flex items-center justify-center min-h-dvh">
+                <div class="text-xs text-white/50 flicker">LOADING...</div>
             </div>
-
-            <div
-                class="flex items-center gap-2 pb-3 mb-4 border-b border-white/20 text-xs flicker"
-                style="animation-delay: 80ms"
-            >
-                <button
-                    onclick={() => {
-                        currentTab = "2fa";
-                        showAddPw = false;
-                    }}
-                    class="bg-transparent cursor-pointer px-2 py-0.5 {currentTab ===
-                    '2fa'
-                        ? 'text-white ring-1 ring-white/30'
-                        : 'text-white/50 hover:text-white'}">2FA</button
-                >
-                <button
-                    onclick={() => {
-                        currentTab = "passwords";
-                        showAddTfa = false;
-                    }}
-                    class="bg-transparent cursor-pointer px-2 py-0.5 {currentTab ===
-                    'passwords'
-                        ? 'text-white ring-1 ring-white/30'
-                        : 'text-white/50 hover:text-white'}">PW</button
-                >
-                <span class="shrink-0 ml-2">&gt;</span>
-                <input
-                    type="text"
-                    bind:value={searchQuery}
-                    class="bg-transparent text-white flex-1 min-w-1/3 outline-none text-xs"
-                    placeholder="SEARCH"
-                    spellcheck="false"
-                />
-                {#if googleSub}
-                    <button
-                        onclick={handleSignOut}
-                        class="bg-transparent text-white/50 hover:text-white cursor-pointer px-1 shrink-0"
-                        >SIGN OUT</button
-                    >
-                {:else}
-                    <button
-                        onclick={handleSignIn}
-                        disabled={googleLoading}
-                        class="bg-transparent text-white/50 hover:text-white cursor-pointer px-1 shrink-0 disabled:opacity-30"
-                        >{googleLoading ? "..." : "SIGN IN"}</button
-                    >
-                {/if}
-                <!-- {#if currentTab === "2fa" && tfaEntries.length > 0}
-                <div class="flex items-center gap-1.5 ml-auto shrink-0">
-                    <div class="w-16 h-2.5 bg-white/10">
-                        <div
-                            class="bg-white h-full"
-                            style="width: {progress(now)}%"
-                        ></div>
+        {:else if appState === "setup" || appState === "unlock"}
+            <div class="flex flex-col items-center justify-center min-h-dvh">
+                <div class="w-full max-w-sm flex flex-col items-center">
+                    <div class="text-center text-xs mb-6 flicker">
+                        <div class="mb-0.5">KEE</div>
+                        <div class="text-white/50">
+                            2FA &amp; PASSWORD MANAGER
+                        </div>
                     </div>
-                    <span class="w-5 text-right">{remaining(now)}S</span>
-                </div>
-            {/if} -->
-            </div>
-        </div>
+                    <!-- <div class="mb-4 text-xs text-white/50">
+                        {appState === "setup" ? "SET PIN" : "ENTER PIN"}
+                    </div> -->
 
-        <div>
-            {#if currentTab === "2fa"}
-                <div class="mb-2">
-                    <div
-                        class="flex items-center justify-between mb-3 flicker"
-                        style="animation-delay: 160ms"
+                    <input
+                        type="password"
+                        inputmode="numeric"
+                        pattern="[0-9]*"
+                        bind:value={pin}
+                        onkeydown={handlePinKeyDown}
+                        autofocus={true}
+                        class="bg-transparent text-white flex-1 text-center outline-none text-sm mb-3"
+                        placeholder="******"
+                        disabled={pinLoading}
+                    />
+
+                    {#if pinError}
+                        <div class="text-xs text-white/50 mb-3">
+                            [{pinError}]
+                        </div>
+                    {/if}
+
+                    {#if !pinError}
+                        <div class="text-xs text-white/50 mb-3">{appState === "setup" ? "CREATE PIN" : "ENTER PIN"}</div>
+                    {/if}
+                    <!-- <button
+                        onclick={appState === "setup"
+                            ? handlePinSetup
+                            : handlePinUnlock}
+                        disabled={pinLoading}
+                        class="bg-transparent text-white cursor-pointer hover:bg-white hover:text-black px-2 py-0.5 text-xs disabled:opacity-30"
                     >
-                        <span class="text-xs"
-                            ><span class="text-white/50">//</span>
-                            [{filteredTfa.length}] 2FA {filteredTfa.length === 1
-                                ? "ENTRY"
-                                : "ENTRIES"}
-                        </span>
-                        <div class="flex items-center justify-end gap-4">
-                            <span class="w-5 text-right text-xs"
-                                >[{remaining(now)}S]</span
+                        {pinLoading
+                            ? "..."
+                            : appState === "setup"
+                              ? "SET PIN"
+                              : "UNLOCK"}
+                    </button> -->
+                </div>
+            </div>
+        {:else}
+            <div class="sticky top-0 z-10 bg-black pt-4">
+                <div
+                    class="text-center text-xs mb-4 flicker"
+                    style="animation-delay: 0ms"
+                >
+                    <div class="mb-0.5">KEE</div>
+                    <div class="text-white/50">2FA &amp; PASSWORD MANAGER</div>
+                </div>
+
+                <div
+                    class="flex items-center gap-2 pb-3 mb-4 border-b border-white/20 text-xs flicker"
+                    style="animation-delay: 80ms"
+                >
+                    <button
+                        onclick={() => {
+                            currentTab = "2fa";
+                            showAddPw = false;
+                        }}
+                        class="bg-transparent cursor-pointer px-2 py-0.5 {currentTab ===
+                        '2fa'
+                            ? 'text-white ring-1 ring-white/30'
+                            : 'text-white/50 hover:text-white'}">2FA</button
+                    >
+                    <button
+                        onclick={() => {
+                            currentTab = "passwords";
+                            showAddTfa = false;
+                        }}
+                        class="bg-transparent cursor-pointer px-2 py-0.5 {currentTab ===
+                        'passwords'
+                            ? 'text-white ring-1 ring-white/30'
+                            : 'text-white/50 hover:text-white'}">PW</button
+                    >
+                    <span class="shrink-0 ml-2">&gt;</span>
+                    <input
+                        type="text"
+                        bind:value={searchQuery}
+                        class="bg-transparent text-white flex-1 min-w-1/3 outline-none text-xs"
+                        placeholder="SEARCH"
+                        spellcheck="false"
+                    />
+                    {#if googleSub}
+                        <button
+                            onclick={handleSignOut}
+                            class="bg-transparent text-white/50 hover:text-white cursor-pointer px-1 shrink-0"
+                            >SIGN OUT</button
+                        >
+                    {:else}
+                        <button
+                            onclick={handleSignIn}
+                            disabled={googleLoading}
+                            class="bg-transparent text-white/50 hover:text-white cursor-pointer px-1 shrink-0 disabled:opacity-30"
+                            >{googleLoading ? "..." : "SIGN IN"}</button
+                        >
+                    {/if}
+                </div>
+            </div>
+
+            <div>
+                {#if currentTab === "2fa"}
+                    <div class="mb-2">
+                        <div
+                            class="flex items-center justify-between mb-3 flicker"
+                            style="animation-delay: 160ms"
+                        >
+                            <span class="text-xs"
+                                ><span class="text-white/50">//</span>
+                                [{filteredTfa.length}] 2FA {filteredTfa.length ===
+                                1
+                                    ? "ENTRY"
+                                    : "ENTRIES"}
+                            </span>
+                            <div class="flex items-center justify-end gap-4">
+                                <span class="w-5 text-right text-xs"
+                                    >[{remaining(now)}S]</span
+                                >
+                                <button
+                                    onclick={openAddTfa}
+                                    class="bg-transparent text-white cursor-pointer hover:bg-white hover:text-black px-2 py-0.5 text-xs"
+                                >
+                                    {showAddTfa ? "[X] CANCEL" : "[+] ADD"}
+                                </button>
+                            </div>
+                        </div>
+
+                        {#if showAddTfa}
+                            <div class="pl-4 mb-3">
+                                <div class="flex items-center gap-2 mb-2">
+                                    <span class="shrink-0 text-xs"
+                                        >LABEL &gt;</span
+                                    >
+                                    <input
+                                        type="text"
+                                        bind:value={newTfaLabel}
+                                        class="bg-transparent text-white flex-1 outline-none text-sm"
+                                        placeholder="E.G. GITHUB"
+                                        spellcheck="false"
+                                    />
+                                </div>
+                                <div class="flex items-center gap-2 mb-3">
+                                    <span class="shrink-0 text-xs"
+                                        >SECRET &gt;</span
+                                    >
+                                    <input
+                                        type="text"
+                                        bind:value={newTfaSecret}
+                                        class="bg-transparent text-white flex-1 outline-none text-sm normal-case"
+                                        placeholder="BASE32 SECRET"
+                                        spellcheck="false"
+                                    />
+                                </div>
+                                {#if showQrScanner}
+                                    <div
+                                        id="qr-video"
+                                        class="w-full mb-3 bg-white/5"
+                                    ></div>
+                                {/if}
+                                <div class="flex gap-2 flex-wrap">
+                                    <button
+                                        onclick={addTfa}
+                                        disabled={!newTfaLabel.trim() ||
+                                            !newTfaSecret.trim()}
+                                        class="bg-transparent text-white cursor-pointer hover:bg-white hover:text-black px-2 py-0.5 text-xs disabled:opacity-30 disabled:cursor-default"
+                                    >
+                                        SAVE
+                                    </button>
+                                    <button
+                                        onclick={showQrScanner
+                                            ? stopQrScanner
+                                            : startQrScanner}
+                                        class="bg-transparent text-white cursor-pointer hover:bg-white hover:text-black px-2 py-0.5 text-xs"
+                                    >
+                                        {showQrScanner
+                                            ? "[X] STOP SCAN"
+                                            : "[QR] SCAN"}
+                                    </button>
+                                    <button
+                                        onclick={() => {
+                                            showAddTfa = false;
+                                            showQrScanner = false;
+                                            newTfaLabel = "";
+                                            newTfaSecret = "";
+                                        }}
+                                        class="bg-transparent text-white cursor-pointer hover:bg-white hover:text-black px-2 py-0.5 text-xs"
+                                    >
+                                        CANCEL
+                                    </button>
+                                </div>
+                            </div>
+                        {/if}
+
+                        {#each filteredTfa as entry, i (entry.id)}
+                            <div
+                                class="flex items-center gap-2 py-3 flicker"
+                                style="animation-delay: {240 + i * 60}ms"
+                            >
+                                <div class="flex flex-1 flex-col">
+                                    <span
+                                        class="truncate text-xs text-white/50 shrink-0"
+                                        title={entry.label}>{entry.label}</span
+                                    >
+                                    <span
+                                        class="flex-1 text-2xl tracking-wider font-bold normal-case"
+                                    >
+                                        <TextScramble
+                                            text={tokens[entry.id]
+                                                ? tokens[entry.id].slice(0, 3) +
+                                                  " " +
+                                                  tokens[entry.id].slice(3)
+                                                : "------"}
+                                        />
+                                    </span>
+                                </div>
+
+                                <button
+                                    onclick={() =>
+                                        copyPw(
+                                            entry.id,
+                                            tokens[entry.id] || "",
+                                        )}
+                                    class="bg-transparent mt-4 text-white cursor-pointer hover:bg-white hover:text-black px-2 py-1 text-sm shrink-0 leading-none"
+                                >
+                                    {copiedId === entry.id ? "OK" : "COPY"}
+                                </button>
+                                <button
+                                    onclick={() => deleteTfa(entry.id)}
+                                    class="bg-transparent mt-4 text-white cursor-pointer hover:bg-white hover:text-black px-2 py-1 text-sm leading-none shrink-0"
+                                >
+                                    X
+                                </button>
+                            </div>
+                        {:else}
+                            {#if !showAddTfa}
+                                <div class="text-white/50 text-xs pl-4">
+                                    {searchQuery
+                                        ? "NO MATCHING 2FA ENTRIES"
+                                        : "NO 2FA ENTRIES YET"}
+                                </div>
+                            {/if}
+                        {/each}
+                    </div>
+                {/if}
+
+                {#if currentTab === "passwords"}
+                    <div class="mb-2">
+                        <div
+                            class="flex items-center justify-between mb-3 flicker"
+                            style="animation-delay: 160ms"
+                        >
+                            <span class="text-xs"
+                                ><span class="text-white/50">//</span>
+                                [{filteredPw.length}]
+                                {filteredPw.length === 1
+                                    ? "PASSWORD"
+                                    : "PASSWORDS"}</span
                             >
                             <button
-                                onclick={openAddTfa}
+                                onclick={openAddPw}
                                 class="bg-transparent text-white cursor-pointer hover:bg-white hover:text-black px-2 py-0.5 text-xs"
                             >
-                                {showAddTfa ? "[X] CANCEL" : "[+] ADD"}
+                                {showAddPw ? "[X] CANCEL" : "[+] ADD"}
                             </button>
                         </div>
-                    </div>
 
-                    {#if showAddTfa}
-                        <div class="pl-4 mb-3">
-                            <div class="flex items-center gap-2 mb-2">
-                                <span class="shrink-0 text-xs">LABEL &gt;</span>
-                                <input
-                                    type="text"
-                                    bind:value={newTfaLabel}
-                                    class="bg-transparent text-white flex-1 outline-none text-sm"
-                                    placeholder="E.G. GITHUB"
-                                    spellcheck="false"
-                                />
-                            </div>
-                            <div class="flex items-center gap-2 mb-3">
-                                <span class="shrink-0 text-xs">SECRET &gt;</span
-                                >
-                                <input
-                                    type="text"
-                                    bind:value={newTfaSecret}
-                                    class="bg-transparent text-white flex-1 outline-none text-sm normal-case"
-                                    placeholder="BASE32 SECRET"
-                                    spellcheck="false"
-                                />
-                            </div>
-                            {#if showQrScanner}
-                                <div
-                                    id="qr-video"
-                                    class="w-full mb-3 bg-white/5"
-                                ></div>
-                            {/if}
-                            <div class="flex gap-2 flex-wrap">
-                                <button
-                                    onclick={addTfa}
-                                    disabled={!newTfaLabel.trim() ||
-                                        !newTfaSecret.trim()}
-                                    class="bg-transparent text-white cursor-pointer hover:bg-white hover:text-black px-2 py-0.5 text-xs disabled:opacity-30 disabled:cursor-default"
-                                >
-                                    SAVE
-                                </button>
-                                <button
-                                    onclick={showQrScanner
-                                        ? stopQrScanner
-                                        : startQrScanner}
-                                    class="bg-transparent text-white cursor-pointer hover:bg-white hover:text-black px-2 py-0.5 text-xs"
-                                >
-                                    {showQrScanner
-                                        ? "[X] STOP SCAN"
-                                        : "[QR] SCAN"}
-                                </button>
-                                <button
-                                    onclick={() => {
-                                        showAddTfa = false;
-                                        showQrScanner = false;
-                                        newTfaLabel = "";
-                                        newTfaSecret = "";
-                                    }}
-                                    class="bg-transparent text-white cursor-pointer hover:bg-white hover:text-black px-2 py-0.5 text-xs"
-                                >
-                                    CANCEL
-                                </button>
-                            </div>
-                        </div>
-                    {/if}
-
-                    {#each filteredTfa as entry, i (entry.id)}
-                        <div
-                            class="flex items-center gap-2 py-3 flicker"
-                            style="animation-delay: {240 + i * 60}ms"
-                        >
-                            <div class="flex flex-1 flex-col">
-                                <span
-                                    class="truncate text-xs text-white/50 shrink-0"
-                                    title={entry.label}>{entry.label}</span
-                                >
-                                <span
-                                    class="flex-1 text-2xl tracking-wider font-bold normal-case"
-                                >
-                                    <TextScramble
-                                        text={tokens[entry.id]
-                                            ? tokens[entry.id].slice(0, 3) +
-                                              " " +
-                                              tokens[entry.id].slice(3)
-                                            : "------"}
+                        {#if showAddPw}
+                            <div class="pl-4 mb-3">
+                                <div class="flex items-center gap-2 mb-2">
+                                    <span class="shrink-0 text-xs"
+                                        >LABEL &gt;</span
+                                    >
+                                    <input
+                                        type="text"
+                                        bind:value={newPwLabel}
+                                        class="bg-transparent text-white flex-1 outline-none text-sm"
+                                        placeholder="E.G. WIFI"
+                                        spellcheck="false"
                                     />
-                                </span>
-                            </div>
-
-                            <button
-                                onclick={() =>
-                                    copyPw(entry.id, tokens[entry.id] || "")}
-                                class="bg-transparent mt-4 text-white cursor-pointer hover:bg-white hover:text-black px-2 py-1 text-sm shrink-0 leading-none"
-                            >
-                                {copiedId === entry.id ? "OK" : "COPY"}
-                            </button>
-                            <button
-                                onclick={() => deleteTfa(entry.id)}
-                                class="bg-transparent mt-4 text-white cursor-pointer hover:bg-white hover:text-black px-2 py-1 text-sm leading-none shrink-0"
-                            >
-                                X
-                            </button>
-                        </div>
-                    {:else}
-                        {#if !showAddTfa}
-                            <div class="text-white/50 text-xs pl-4">
-                                {searchQuery
-                                    ? "NO MATCHING 2FA ENTRIES"
-                                    : "NO 2FA ENTRIES YET"}
-                            </div>
-                        {/if}
-                    {/each}
-                </div>
-            {/if}
-
-            {#if currentTab === "passwords"}
-                <div class="mb-2">
-                    <div
-                        class="flex items-center justify-between mb-3 flicker"
-                        style="animation-delay: 160ms"
-                    >
-                        <span class="text-xs"
-                            ><span class="text-white/50">//</span>
-                            [{filteredPw.length}]
-                            {filteredPw.length === 1
-                                ? "PASSWORD"
-                                : "PASSWORDS"}</span
-                        >
-                        <button
-                            onclick={openAddPw}
-                            class="bg-transparent text-white cursor-pointer hover:bg-white hover:text-black px-2 py-0.5 text-xs"
-                        >
-                            {showAddPw ? "[X] CANCEL" : "[+] ADD"}
-                        </button>
-                    </div>
-
-                    {#if showAddPw}
-                        <div class="pl-4 mb-3">
-                            <div class="flex items-center gap-2 mb-2">
-                                <span class="shrink-0 text-xs">LABEL &gt;</span>
-                                <input
-                                    type="text"
-                                    bind:value={newPwLabel}
-                                    class="bg-transparent text-white flex-1 outline-none text-sm"
-                                    placeholder="E.G. WIFI"
-                                    spellcheck="false"
-                                />
-                            </div>
-                            <div
-                                class="flex flex-wrap items-center gap-x-3 gap-y-1 mb-2 text-xs"
-                            >
-                                <span>
-                                    LEN [<span
-                                        contenteditable="true"
-                                        bind:textContent={
-                                            pwLen as unknown as string
-                                        }
-                                        onkeydown={allowOnlyNumbers}
-                                        role="textbox"
-                                        tabindex="0"
-                                        class="inline-block bg-transparent text-white outline-none text-center text-xs"
-                                    ></span>]
-                                </span>
-                                <button
-                                    class="bg-transparent text-white cursor-pointer outline-none px-0"
-                                    onclick={() => (pwUpper = !pwUpper)}
+                                </div>
+                                <div
+                                    class="flex flex-wrap items-center gap-x-3 gap-y-1 mb-2 text-xs"
                                 >
-                                    A-Z [{pwUpper ? "X" : " "}]
-                                </button>
-                                <button
-                                    class="bg-transparent text-white cursor-pointer outline-none px-0"
-                                    onclick={() => (pwLower = !pwLower)}
-                                >
-                                    A-Z [{pwLower ? "X" : " "}]
-                                </button>
-                                <button
-                                    class="bg-transparent text-white cursor-pointer outline-none px-0"
-                                    onclick={() => (pwDigits = !pwDigits)}
-                                >
-                                    0-9 [{pwDigits ? "X" : " "}]
-                                </button>
-                                <button
-                                    class="bg-transparent text-white cursor-pointer outline-none px-0"
-                                    onclick={() => (pwSymbols = !pwSymbols)}
-                                >
-                                    !@# [{pwSymbols ? "X" : " "}]
-                                </button>
-                                <button
-                                    class="bg-transparent text-white cursor-pointer outline-none px-0"
-                                    onclick={() => (pwAmb = !pwAmb)}
-                                >
-                                    AMB [{pwAmb ? "X" : " "}]
-                                </button>
-                            </div>
-                            <div
-                                class="bg-white/5 px-3 py-3 mb-2 text-lg break-all normal-case"
-                            >
-                                {#if newPwValue}
-                                    <TextScramble text={newPwValue} />
-                                {:else}
-                                    SELECT AT LEAST ONE CHARACTER SET
-                                {/if}
-                            </div>
-                            <div class="flex gap-2">
-                                <button
-                                    onclick={genPw}
-                                    class="bg-transparent text-white cursor-pointer hover:bg-white hover:text-black px-2 py-0.5 text-xs"
-                                >
-                                    GENERATE
-                                </button>
-                                <button
-                                    onclick={() => addPw()}
-                                    class="bg-transparent text-white cursor-pointer hover:bg-white hover:text-black px-2 py-0.5 text-xs"
-                                >
-                                    SAVE
-                                </button>
-                                <button
-                                    onclick={() => {
-                                        showAddPw = false;
-                                        newPwLabel = "";
-                                        newPwValue = "";
-                                    }}
-                                    class="bg-transparent text-white cursor-pointer hover:bg-white hover:text-black px-2 py-0.5 text-xs"
-                                >
-                                    CANCEL
-                                </button>
-                            </div>
-                        </div>
-                    {/if}
-
-                    {#each filteredPw as entry, i (entry.id)}
-                        <div
-                            class="flex items-center gap-2 py-3 flicker"
-                            style="animation-delay: {240 + i * 60}ms"
-                        >
-                            <div class="flex flex-1 flex-col">
-                                <span
-                                    class="truncate text-xs text-white/50 shrink-0"
-                                    title={entry.label}>{entry.label}</span
-                                >
-                                {#if revealedPwId === entry.id}
-                                    <span
-                                        role="button"
-                                        tabindex="0"
-                                        onclick={() => hidePw(entry.id)}
-                                        onkeydown={(e) => {
-                                            if (
-                                                e.key === "Enter" ||
-                                                e.key === " "
-                                            ) {
-                                                e.preventDefault();
-                                                hidePw(entry.id);
+                                    <span>
+                                        LEN [<span
+                                            contenteditable="true"
+                                            bind:textContent={
+                                                pwLen as unknown as string
                                             }
-                                        }}
-                                        class="flex-1 text-left text-base normal-case cursor-pointer"
-                                    >
-                                        <TextScramble text={entry.value} />
+                                            onkeydown={allowOnlyNumbers}
+                                            role="textbox"
+                                            tabindex="0"
+                                            class="inline-block bg-transparent text-white outline-none text-center text-xs"
+                                        ></span>]
                                     </span>
-                                {:else}
-                                    <span
-                                        role="button"
-                                        tabindex="0"
-                                        onclick={() => revealPw(entry.id)}
-                                        onkeydown={(e) => {
-                                            if (
-                                                e.key === "Enter" ||
-                                                e.key === " "
-                                            ) {
-                                                e.preventDefault();
-                                                revealPw(entry.id);
-                                            }
-                                        }}
-                                        class="flex-1 text-left text-base truncate normal-case cursor-pointer"
-                                        >{"*".repeat(entry.value.length)}</span
+                                    <button
+                                        class="bg-transparent text-white cursor-pointer outline-none px-0"
+                                        onclick={() => (pwUpper = !pwUpper)}
                                     >
-                                {/if}
-                            </div>
-
-                            <button
-                                onclick={() => copyPw(entry.id, entry.value)}
-                                class="bg-transparent mt-3 text-white cursor-pointer hover:bg-white hover:text-black px-2 py-1 text-sm shrink-0 leading-none"
-                            >
-                                {copiedId === entry.id ? "OK" : "COPY"}
-                            </button>
-                            <button
-                                onclick={() => deletePw(entry.id)}
-                                class="bg-transparent mt-3 text-white cursor-pointer hover:bg-white hover:text-black px-2 py-1 text-sm shrink-0 leading-none"
-                            >
-                                X
-                            </button>
-                        </div>
-                    {:else}
-                        {#if !showAddPw}
-                            <div class="text-white/50 text-xs pl-4">
-                                {searchQuery
-                                    ? "NO MATCHING PASSWORDS"
-                                    : "NO PASSWORDS YET"}
+                                        A-Z [{pwUpper ? "X" : " "}]
+                                    </button>
+                                    <button
+                                        class="bg-transparent text-white cursor-pointer outline-none px-0"
+                                        onclick={() => (pwLower = !pwLower)}
+                                    >
+                                        A-Z [{pwLower ? "X" : " "}]
+                                    </button>
+                                    <button
+                                        class="bg-transparent text-white cursor-pointer outline-none px-0"
+                                        onclick={() => (pwDigits = !pwDigits)}
+                                    >
+                                        0-9 [{pwDigits ? "X" : " "}]
+                                    </button>
+                                    <button
+                                        class="bg-transparent text-white cursor-pointer outline-none px-0"
+                                        onclick={() => (pwSymbols = !pwSymbols)}
+                                    >
+                                        !@# [{pwSymbols ? "X" : " "}]
+                                    </button>
+                                    <button
+                                        class="bg-transparent text-white cursor-pointer outline-none px-0"
+                                        onclick={() => (pwAmb = !pwAmb)}
+                                    >
+                                        AMB [{pwAmb ? "X" : " "}]
+                                    </button>
+                                </div>
+                                <div
+                                    class="bg-white/5 px-3 py-3 mb-2 text-lg break-all normal-case"
+                                >
+                                    {#if newPwValue}
+                                        <TextScramble text={newPwValue} />
+                                    {:else}
+                                        SELECT AT LEAST ONE CHARACTER SET
+                                    {/if}
+                                </div>
+                                <div class="flex gap-2">
+                                    <button
+                                        onclick={genPw}
+                                        class="bg-transparent text-white cursor-pointer hover:bg-white hover:text-black px-2 py-0.5 text-xs"
+                                    >
+                                        GENERATE
+                                    </button>
+                                    <button
+                                        onclick={() => addPw()}
+                                        class="bg-transparent text-white cursor-pointer hover:bg-white hover:text-black px-2 py-0.5 text-xs"
+                                    >
+                                        SAVE
+                                    </button>
+                                    <button
+                                        onclick={() => {
+                                            showAddPw = false;
+                                            newPwLabel = "";
+                                            newPwValue = "";
+                                        }}
+                                        class="bg-transparent text-white cursor-pointer hover:bg-white hover:text-black px-2 py-0.5 text-xs"
+                                    >
+                                        CANCEL
+                                    </button>
+                                </div>
                             </div>
                         {/if}
-                    {/each}
-                </div>
-            {/if}
 
-            {#if backupMsg}
-                <p
-                    class="text-white/30 text-xs shrink-0 flicker text-center mb-6"
-                >
-                    [{backupMsg}]
-                </p>
-            {/if}
-        </div>
+                        {#each filteredPw as entry, i (entry.id)}
+                            <div
+                                class="flex items-center gap-2 py-3 flicker"
+                                style="animation-delay: {240 + i * 60}ms"
+                            >
+                                <div class="flex flex-1 flex-col">
+                                    <span
+                                        class="truncate text-xs text-white/50 shrink-0"
+                                        title={entry.label}>{entry.label}</span
+                                    >
+                                    {#if revealedPwId === entry.id}
+                                        <span
+                                            role="button"
+                                            tabindex="0"
+                                            onclick={() => hidePw(entry.id)}
+                                            onkeydown={(e) => {
+                                                if (
+                                                    e.key === "Enter" ||
+                                                    e.key === " "
+                                                ) {
+                                                    e.preventDefault();
+                                                    hidePw(entry.id);
+                                                }
+                                            }}
+                                            class="flex-1 text-left text-base normal-case cursor-pointer"
+                                        >
+                                            <TextScramble text={entry.value} />
+                                        </span>
+                                    {:else}
+                                        <span
+                                            role="button"
+                                            tabindex="0"
+                                            onclick={() => revealPw(entry.id)}
+                                            onkeydown={(e) => {
+                                                if (
+                                                    e.key === "Enter" ||
+                                                    e.key === " "
+                                                ) {
+                                                    e.preventDefault();
+                                                    revealPw(entry.id);
+                                                }
+                                            }}
+                                            class="flex-1 text-left text-base truncate normal-case cursor-pointer"
+                                            >{"*".repeat(
+                                                entry.value.length,
+                                            )}</span
+                                        >
+                                    {/if}
+                                </div>
+
+                                <button
+                                    onclick={() =>
+                                        copyPw(entry.id, entry.value)}
+                                    class="bg-transparent mt-3 text-white cursor-pointer hover:bg-white hover:text-black px-2 py-1 text-sm shrink-0 leading-none"
+                                >
+                                    {copiedId === entry.id ? "OK" : "COPY"}
+                                </button>
+                                <button
+                                    onclick={() => deletePw(entry.id)}
+                                    class="bg-transparent mt-3 text-white cursor-pointer hover:bg-white hover:text-black px-2 py-1 text-sm shrink-0 leading-none"
+                                >
+                                    X
+                                </button>
+                            </div>
+                        {:else}
+                            {#if !showAddPw}
+                                <div class="text-white/50 text-xs pl-4">
+                                    {searchQuery
+                                        ? "NO MATCHING PASSWORDS"
+                                        : "NO PASSWORDS YET"}
+                                </div>
+                            {/if}
+                        {/each}
+                    </div>
+                {/if}
+
+                {#if backupMsg}
+                    <p
+                        class="text-white/30 text-xs shrink-0 flicker text-center mb-6"
+                    >
+                        [{backupMsg}]
+                    </p>
+                {/if}
+            </div>
+        {/if}
     </div>
 </div>

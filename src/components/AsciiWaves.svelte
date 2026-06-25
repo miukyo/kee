@@ -5,7 +5,7 @@
         duration?: number;
     }
 
-    let { duration = 2600 }: Props = $props();
+    let { duration = 2000 }: Props = $props();
     let visible = $state(true);
     let fading = $state(false);
     let canvas = $state<HTMLCanvasElement>();

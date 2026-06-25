@@ -1,6 +1,5 @@
 import type { TwoFactorEntry } from "./types";
 import { generateTOTP } from "./crypto";
-import { saveTfa, removeTfa } from "./db";
 
 export async function addTfaFn(
     label: string,
@@ -14,7 +13,6 @@ export async function addTfaFn(
         secret,
         createdAt: Date.now(),
     };
-    await saveTfa(entry);
     const token = await generateTOTP(entry.secret);
     return {
         entries: [...entries, entry],
@@ -27,7 +25,6 @@ export async function deleteTfaFn(
     entries: TwoFactorEntry[],
     tokens: Record<string, string>,
 ): Promise<{ entries: TwoFactorEntry[]; tokens: Record<string, string> }> {
-    await removeTfa(id);
     const { [id]: _, ...rest } = tokens;
     return { entries: entries.filter((e) => e.id !== id), tokens: rest };
 }
