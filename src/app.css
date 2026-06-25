@@ -25,3 +25,8 @@ input::-webkit-inner-spin-button {
   opacity: 0;
   animation: flicker 200ms forwards;
 }
+
+::selection {
+  background-color: #fff; 
+  color: #000;          
+}
